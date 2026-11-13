@@ -459,10 +459,10 @@ jobs:
           if [ -z "$KSU_VER" ]; then
             KSU_VER="${{ needs.get-manager.outputs.ksuVer }}"
           fi
-          SUS_VER="${{ needs.get-manager.outputs.susVer }}"
           echo "KSU_VER=$KSU_VER" >> $GITHUB_ENV
-          echo "SUS_VER=$SUS_VER" >> $GITHUB_ENV
 
+          # SUSFS 版本/提交不在这里算：由下游「汇总 SUSFS 提交信息」按 config/config
+          # 锁定的 commit 解析，届时再生成 RELEASE_NAME / RELEASE_HEADER。
           # 功能开关显示
           echo "LZ4_STATUS=${{ inputs.use_zram && '开启' || '未开启' }}" >> $GITHUB_ENV
           echo "BBG_STATUS=${{ inputs.use_bbg && '开启' || '未开启' }}" >> $GITHUB_ENV
@@ -498,8 +498,8 @@ jobs:
           fi
 
           # 发布标题与正文标题
-          echo "RELEASE_NAME=GKI Kernel: ${KSU_NAME} ${KSU_VER} + SUSFS ${SUS_VER}" >> $GITHUB_ENV
-          echo "RELEASE_HEADER=**${KSU_NAME} ${KSU_VER}** + **SUSFS ${SUS_VER}**" >> $GITHUB_ENV
+          # RELEASE_NAME / RELEASE_HEADER 依赖 SUSFS 版本，必须在「汇总 SUSFS 元数据」
+          # 之后生成（SUS_VER 由那里从构建元数据得出）。
 
       # ==================== 验证构建状态 ====================
       # 确保所有选中的构建任务都成功完成
@@ -590,28 +590,155 @@ jobs:
           echo "KSU_REF=$KSU_REF" >> $GITHUB_ENV
           echo "KSU_URL=$KSU_URL" >> $GITHUB_ENV
 
-      # ==================== 获取 SUSFS 提交信息 ====================
-      # 获取各版本 SUSFS 的 Git 提交信息
-      - name: 获取 SUSFS 提交信息
+      # ==================== 汇总 SUSFS 元数据 ====================
+      # 不再需要构建产物/artifact：SUSFS 版本可以按 config/config 的锁定结果直接解析。
+      #   custom=true  → 取各分支锁定的 commit（构建时检出的就是这个 commit），
+      #                  再从该 commit 的 module.prop 读取 version
+      #   custom=false → 退化为分支当前 HEAD（构建时同源），并提示未锁定
+      # 只在 Release 作业里跑一次，秒级完成，不产生任何额外文件。
+      - name: 汇总 SUSFS 提交信息
         run: |
-          GITLAB_OWNER="simonpunk"
-          GITLAB_REPO="susfs4ksu"
-          declare -A BRANCH_MAP=(
-            ["gki_android12_5_10"]="gki-android12-5.10"
-            ["gki_android13_5_15"]="gki-android13-5.15"
-            ["gki_android14_6_1"]="gki-android14-6.1"
-            ["gki_android15_6_6"]="gki-android15-6.6"
-            ["gki_android16_6_12"]="gki-android16-6.12"
-          )
-          for var_name in "${!BRANCH_MAP[@]}"; do
-            branch_name="${BRANCH_MAP[$var_name]}"
-            COMMIT_HASH=$(git ls-remote https://gitlab.com/$GITLAB_OWNER/$GITLAB_REPO.git refs/heads/$branch_name | awk '{ print $1 }')
-            if [[ -n "$COMMIT_HASH" ]]; then
-              COMMIT_URL="https://gitlab.com/$GITLAB_OWNER/$GITLAB_REPO/-/commit/$COMMIT_HASH"
-              echo "COMMIT_HASH_${var_name}=$COMMIT_HASH" >> "$GITHUB_ENV"
-              echo "COMMIT_URL_${var_name}=$COMMIT_URL" >> "$GITHUB_ENV"
+          GITLAB_RAW="https://gitlab.com/simonpunk/susfs4ksu/-/raw"
+          SUSFS_SOURCE_URL="https://gitlab.com/simonpunk/susfs4ksu.git"
+          CUSTOM_ENABLED="false"
+          if [ -f config/config ]; then
+            CUSTOM_ENABLED=$(grep "^custom=" config/config | cut -d'=' -f2)
+          fi
+          echo "config/config custom=${CUSTOM_ENABLED}"
+
+          # 解析某个分支实际参与的 commit 与版本；成功时设置 RS_COMMIT/RS_VERSION
+          RS_COMMIT=""
+          RS_VERSION=""
+          resolve_susfs() {
+            local branch="$1" commit="" prop=""
+            RS_COMMIT=""
+            RS_VERSION=""
+            if [ "$CUSTOM_ENABLED" = "true" ]; then
+              commit=$(grep "^${branch}=" config/config 2>/dev/null | cut -d'=' -f2)
+              if [ -z "$commit" ]; then
+                echo "::warning title=SUSFS 未锁定::config/config 中缺少 $branch 的 commit"
+                return 1
+              fi
+            else
+              commit=$(git ls-remote "$SUSFS_SOURCE_URL" "refs/heads/$branch" 2>/dev/null | awk '{ print $1 }')
+              if [ -z "$commit" ]; then
+                echo "::warning title=SUSFS 分支解析失败::无法获取 $branch 的 HEAD"
+                return 1
+              fi
+              echo "custom=false：$branch 按当前分支 HEAD $commit 解析（与构建同源）"
+            fi
+            prop=$(curl -fsSL --retry 3 --retry-delay 2 "$GITLAB_RAW/$commit/ksu_module_susfs/module.prop" 2>/dev/null) || return 1
+            RS_VERSION=$(printf '%s\n' "$prop" | awk '
+              index($0, "version=") == 1 {
+                v = substr($0, length("version=") + 1)
+                gsub(/\r/, "", v)
+                gsub(/^[ \t]+|[ \t]+$/, "", v)
+                print v
+                exit
+              }
+            ')
+            if [ -z "$RS_VERSION" ]; then
+              RS_COMMIT=""
+              return 1
+            fi
+            RS_COMMIT="$commit"
+          }
+
+          SUSFS_LABELS=()
+          SUSFS_BRANCHES=()
+          SUSFS_VERSIONS=()
+          SUSFS_COMMITS=()
+
+          add_susfs_build() {
+            local selected="$1" label="$2" branch="$3"
+            [[ "$selected" == "true" ]] || return 0
+            local version="" commit=""
+            if resolve_susfs "$branch"; then
+              version="$RS_VERSION"
+              commit="$RS_COMMIT"
+            else
+              echo "::warning title=SUSFS 元数据解析失败::$label（$branch）未能解析出版本"
+            fi
+            SUSFS_LABELS+=("$label")
+            SUSFS_BRANCHES+=("$branch")
+            SUSFS_VERSIONS+=("$version")
+            SUSFS_COMMITS+=("$commit")
+          }
+          add_susfs_build "${{ inputs.build_a12_5_10 || inputs.build_all }}" "Android 12 / 5.10" "gki-android12-5.10"
+          add_susfs_build "${{ inputs.build_a13_5_15 || inputs.build_all }}" "Android 13 / 5.15" "gki-android13-5.15"
+          add_susfs_build "${{ inputs.build_a14_6_1 || inputs.build_all }}" "Android 14 / 6.1" "gki-android14-6.1"
+          add_susfs_build "${{ inputs.build_a15_6_6 || inputs.build_all }}" "Android 15 / 6.6" "gki-android15-6.6"
+          add_susfs_build "${{ inputs.build_a16_6_12 || inputs.build_all }}" "Android 16 / 6.12" "gki-android16-6.12"
+
+          # SUS_VER：显示用版本（各构建目标版本不同时用 " / " 连接，不做合并假设）
+          # SUS_VERSION：标签基准版本（取第一个拿到版本的目标，保证标签稳定）
+          SUS_VER=""
+          SUS_VERSION=""
+          declare -A SUS_VERSION_SEEN=()
+          for idx in "${!SUSFS_LABELS[@]}"; do
+            version="${SUSFS_VERSIONS[$idx]}"
+            [[ -n "$version" ]] || continue
+            if [[ -z "$SUS_VERSION" ]]; then
+              SUS_VERSION="$version"
+            fi
+            if [[ -z "${SUS_VERSION_SEEN[$version]:-}" ]]; then
+              SUS_VERSION_SEEN[$version]=1
+              if [[ -z "$SUS_VER" ]]; then
+                SUS_VER="$version"
+              else
+                SUS_VER="$SUS_VER / $version"
+              fi
             fi
           done
+
+          if [[ -z "$SUS_VERSION" ]]; then
+            if [[ "${{ inputs.cancel_susfs }}" == "true" ]]; then
+              echo "SUSFS 已禁用（cancel_susfs=true），Release 不展示 SUSFS 版本"
+              SUS_VER="未启用"
+            elif [[ ${#SUSFS_LABELS[@]} -eq 0 ]]; then
+              # 没有任何构建目标被选中：沿用旧行为的回退版本，不阻断发布
+              echo "::warning title=未选择构建目标::未选择任何构建目标，SUSFS 版本回退为默认值"
+              SUS_VER="未启用"
+            else
+              echo "::error title=SUSFS 版本缺失::SUSFS 已启用，但无法从 config/config 锁定的源码解析出版本，拒绝生成空版本 Release"
+              exit 1
+            fi
+          fi
+          echo "SUS_VER=$SUS_VER" >> $GITHUB_ENV
+          echo "SUS_VERSION=$SUS_VERSION" >> $GITHUB_ENV
+          echo "本次构建 SUSFS 版本: ${SUS_VER:-未知}"
+          echo "RELEASE_NAME=GKI Kernel: ${KSU_NAME} ${KSU_VER} + SUSFS ${SUS_VER}" >> $GITHUB_ENV
+          echo "RELEASE_HEADER=**${KSU_NAME} ${KSU_VER}** + **SUSFS ${SUS_VER}**" >> $GITHUB_ENV
+
+          : > susfs_commits.md
+          : > susfs_table.md
+          for idx in "${!SUSFS_LABELS[@]}"; do
+            label="${SUSFS_LABELS[$idx]}"
+            branch="${SUSFS_BRANCHES[$idx]}"
+            version="${SUSFS_VERSIONS[$idx]}"
+            commit="${SUSFS_COMMITS[$idx]}"
+            if [[ -z "$commit" ]]; then
+              printf -- '- %s: 未能解析 SUSFS 元数据\n' "$label" >> susfs_commits.md
+              printf -- '| %s | %s | - | - |\n' "$label" "${version:-未获取}" >> susfs_table.md
+              continue
+            fi
+            printf -- '- %s: [`%s`](https://gitlab.com/simonpunk/susfs4ksu/-/commit/%s) - %s（`%s`）\n' \
+              "$label" "${commit:0:7}" "$commit" "${version:-未知版本}" "$branch" >> susfs_commits.md
+            printf -- '| %s | `%s` | `%s` | %s |\n' "$label" "${version:-未获取}" "${commit:0:7}" "$SUSFS_SOURCE_URL" >> susfs_table.md
+          done
+
+          if [[ ! -s susfs_commits.md ]]; then
+            if [[ "${{ inputs.cancel_susfs }}" == "true" ]]; then
+              echo "- SUSFS 已禁用（cancel_susfs=true）" > susfs_commits.md
+            else
+              echo "- 未获取到本次构建对应的 SUSFS 提交信息" > susfs_commits.md
+            fi
+          fi
+          if [[ ! -s susfs_table.md ]]; then
+            echo '| - | 未启用 | - | - |' > susfs_table.md
+          fi
+
+          cat susfs_table.md
 
       # ==================== 生成发布说明 ====================
       # 创建包含详细信息的发布说明文档
@@ -644,22 +771,6 @@ jobs:
             build_targets="未选择"
           fi
 
-          : > susfs_commits.md
-          append_susfs_commit() {
-            local selected="$1" label="$2" hash="$3" url="$4"
-            if [[ "$selected" == "true" && -n "$hash" && -n "$url" ]]; then
-              printf -- '- %s: [`%s`](%s)\n' "$label" "${hash:0:7}" "$url" >> susfs_commits.md
-            fi
-          }
-          append_susfs_commit "${{ inputs.build_a12_5_10 || inputs.build_all }}" "Android 12 / 5.10" "${COMMIT_HASH_gki_android12_5_10}" "${COMMIT_URL_gki_android12_5_10}"
-          append_susfs_commit "${{ inputs.build_a13_5_15 || inputs.build_all }}" "Android 13 / 5.15" "${COMMIT_HASH_gki_android13_5_15}" "${COMMIT_URL_gki_android13_5_15}"
-          append_susfs_commit "${{ inputs.build_a14_6_1 || inputs.build_all }}" "Android 14 / 6.1" "${COMMIT_HASH_gki_android14_6_1}" "${COMMIT_URL_gki_android14_6_1}"
-          append_susfs_commit "${{ inputs.build_a15_6_6 || inputs.build_all }}" "Android 15 / 6.6" "${COMMIT_HASH_gki_android15_6_6}" "${COMMIT_URL_gki_android15_6_6}"
-          append_susfs_commit "${{ inputs.build_a16_6_12 || inputs.build_all }}" "Android 16 / 6.12" "${COMMIT_HASH_gki_android16_6_12}" "${COMMIT_URL_gki_android16_6_12}"
-          if [[ ! -s susfs_commits.md ]]; then
-            echo "- 未获取到本次构建对应的 SUSFS 提交信息" > susfs_commits.md
-          fi
-
           cat > release_body.md << EOF
           ## GKI Kernel Release
 
@@ -689,6 +800,12 @@ jobs:
           | Re-Kernel 驱动 | $REKERNEL_STATUS |
           | KPM | $KPM_STATUS |
           | Droidspaces 容器支持 | $DROIDSPACES_STATUS |
+
+          ### SUSFS 版本
+
+          | 构建目标 | 版本 | 提交 | 来源 |
+          |:---|:---|:---|:---|
+          $(cat susfs_table.md)
 
           ### 下载说明
 
@@ -744,10 +861,15 @@ jobs:
       # 根据 SUSFS 版本生成递增的发布标签
       - name: 生成版本标签
         run: |
-          # 获取 SUSFS 版本，如果 get-manager 被跳过则使用默认值
-          SUS_VERSION="${{ needs.get-manager.outputs.susVer }}"
+          # SUS_VERSION 由「设置显示名称」步骤从各构建任务实际检出的源码导出；
+          # 仅在 SUSFS 被禁用（或所有目标都未构建）时才回退到默认基准版本
+          SUS_VERSION="${SUS_VERSION:-}"
           if [ -z "$SUS_VERSION" ]; then
-            echo "警告: 未获取到 SUSFS 版本，使用默认版本号"
+            if [ "${{ inputs.cancel_susfs }}" == "true" ]; then
+              echo "SUSFS 已禁用，标签基准版本回退为 1.0.0"
+            else
+              echo "警告: 未获取到 SUSFS 版本，使用默认版本号"
+            fi
             SUS_VERSION="1.0.0"
           fi
 
@@ -812,14 +934,17 @@ jobs:
         run: |
           echo "准备上传 APK 与 SUSFS 模块..."
           apk_count=$(find ./downloaded-artifacts -type f -name "*.apk" | wc -l || true)
-          sus_count=$(find ./downloaded-artifacts -type f -path "./downloaded-artifacts/susfs-*/*" | wc -l || true)
+          sus_count=$(find ./downloaded-artifacts -type f -path "./downloaded-artifacts/susfs-*/*" \
+            ! -path "./downloaded-artifacts/susfs-meta-*/*" | wc -l || true)
           echo "APK files: ${apk_count}"
           echo "SUSFS files: ${sus_count}"
           find ./downloaded-artifacts -type f -name "*.apk" -print0 | \
           while IFS= read -r -d '' f; do
             gh release upload "$NEW_TAG" "$f" || true
           done
-          find ./downloaded-artifacts -type f -path "./downloaded-artifacts/susfs-*/*" -print0 | \
+          # 只上传「配套 SUSFS 模块」目录内的文件；susfs-meta-*（元数据）不是产物，绝不能上传
+          find ./downloaded-artifacts -type f -path "./downloaded-artifacts/susfs-*/*" \
+            ! -path "./downloaded-artifacts/susfs-meta-*/*" -print0 | \
           while IFS= read -r -d '' f; do
             gh release upload "$NEW_TAG" "$f" || true
           done
@@ -861,3 +986,14 @@ jobs:
           echo "- **标签**: $NEW_TAG" >> $GITHUB_STEP_SUMMARY
           echo "- **类型**: ${{ inputs.release_type }}" >> $GITHUB_STEP_SUMMARY
           echo "- **链接**: https://github.com/$REPO_OWNER/$REPO_NAME/releases/tag/$NEW_TAG" >> $GITHUB_STEP_SUMMARY
+          # SUSFS 源码元数据整轮只在这里汇总一次（build.yml 的 94 个矩阵作业不再各自写摘要）
+          if [ -s susfs_table.md ]; then
+            {
+              echo ""
+              echo "### SUSFS 源码（本次构建实际使用）"
+              echo ""
+              echo "| 构建目标 | 版本 | 提交 | 来源 |"
+              echo "|:---|:---|:---|:---|"
+              cat susfs_table.md
+            } >> $GITHUB_STEP_SUMMARY
+          fi
